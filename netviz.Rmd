@@ -1,0 +1,525 @@
+---
+title: "Network Visualization of X-space"
+output: 
+  html_notebook: 
+    fig_width: 8
+    fig_height: 6
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+# 1. Visualize the space as a network
+
+In this section, we will practice how to visualize the X-spaces with
+traditional network-based method.
+
+The sections are organized according to our viz-pipeline:
+
+-   Data collection and metric calculation (load previous results)
+
+-   Extract the informative part of relation: mst + high proximity
+
+-   Layout generation: force-layout
+
+-   Cluster generation: community detection
+
+-   Aesthetic mapping: desired property -> visual elements
+
+    -   Whole network
+    -   Portfolio
+
+In this tutorial, we will mainly use the `tidyverse` packages for data
+manipulations and `igraph` for network creation and visualization.
+Install and load all necessary packages:
+
+```{r}
+package_list <-
+  c(
+    "tidyverse",
+    "igraph",
+    "viridis",
+    "umap",
+    "reticulate",
+    "tidygraph",
+    "ggraph"
+  )
+# Check if packages are already installed, otherwise install them
+to_install <-
+  package_list[!(package_list %in% installed.packages()[, "Package"])]
+if (length(to_install)) {
+  install.packages(to_install)
+}
+library(tidyverse)
+library(igraph)
+library(viridis)
+library(tidygraph)
+library(ggraph)
+library(umap)
+```
+
+## Data collection and metric calculation (load previous results)
+
+In this part, we need to get a proximity matrix or dataframe as the
+input of following steps. If you are doing your own research on some
+kind of spaces, you need to clean and transform your raw data, and
+assess the relatedness with a similarity or distance metric.
+
+Here we will use a pre-calculated proximity dataframe from the Atlas of
+Economic complexity. You can get this dataframe by following Matte's
+tutorial, or use the output of `economiccomplexity` package.
+
+```{r}
+## Load the data from atlas of economic complexity
+if (!file.exists("hs92_proximities.csv")) {
+  download.file("http://intl-atlas-downloads.s3.amazonaws.com/atlas_2_16_6/hs92_proximities.csv", "hs92_proximities.csv")
+}
+## specify the first two columns of product code as character and the 3rd column proximity as numeric
+proxdf <- read_csv("hs92_proximities.csv", col_types = "ccn")
+head(proxdf)
+```
+
+Let's first examine the distribution of proximity metric, which helps us
+decide in extracting the informative parts.
+
+```{r}
+ggplot(proxdf, aes(x = proximity)) +
+  geom_histogram(bins = 100)
+```
+
+We observed that proximity is right-skewed. There are a few observations
+in the right tail with high proximity, which is good: we can cover the
+informative part without introducing many links.
+
+Load the names of hs code so that we could use for annotation and
+analysis.
+
+```{r}
+if (!file.exists("hs_product.zip")) {
+  download.file("http://intl-atlas-downloads.s3.amazonaws.com/17.0/hs_product.zip", "hs_product.zip")
+}
+hsdf <- read_csv("hs_product.zip", col_types = "c")
+head(hsdf)
+```
+
+Let's only keep the product names used in the calculation of proximity
+(1240 out of 6396):
+
+```{r}
+hsdf$hs_product_code %>% n_distinct()
+proxdf$commoditycode_1 %>% n_distinct()
+```
+
+```{r}
+nodedf <- hsdf %>%
+  filter(hs_product_code %in% proxdf$commoditycode_1) %>%
+  select(hs_product_code, hs_product_name_short_en) %>%
+  arrange(hs_product_code)
+head(nodedf)
+```
+
+### (Optional) visualize the raw proximity matrix
+
+If your data is a proximity dataframe, you could visualize in a matrix
+view as a heatmap with the `geom_tile` function. The natural sorting of
+product codes usually exhibits a block structure:
+
+```{r}
+ggplot(proxdf, aes(commoditycode_1, commoditycode_2, fill = proximity)) +
+  geom_raster() +
+  coord_equal() +
+  scale_fill_viridis() +
+  theme_void()
+```
+
+## Create graph and extract the backbone
+
+Given the proximity dataframe, we could convert them into network object
+in igraph using the node dataframe and proximity/edge dataframe. By
+default, it will create an undirected network.
+
+```{r}
+fullgraph <- graph_from_data_frame(proxdf, directed = FALSE, vertices = nodedf) %>%
+  simplify(remove.multiple = TRUE, remove.loops = TRUE, edge.attr.comb = "first")
+fullgraph
+```
+
+Maximum spanning tree of the full proximity-weighted graph provides the
+basic skeleton that makes sure every nodes are connected.`igraph`
+provides the function to generate the minimum spanning tree for
+distance-weighted graph, let's use 1-proximity as the distance to
+reverse the order and get the skeleton.
+
+```{r}
+gmst <- fullgraph %>% mst(weights = 1 - E(fullgraph)$proximity, algorithm = "prim")
+gmst
+```
+
+The next step is to add the more informative high-proximity edges to the
+mst skeleton. Here it usually need some iterative tweaking of the
+threshold, so we create a copy of the mst skeleton.
+
+The 2007 paper used a threshold 0.55 for the inclusion of proximity
+values, and this threshold seems reasonable on the distribution plot.
+The following code generates the high proximity subgraph, and unions the
+mst.
+
+```{r}
+vizgraph <- fullgraph %>% subgraph.edges(eids = E(fullgraph)[E(fullgraph)$proximity > 0.55])
+vizgraph <- gmst + vizgraph
+E(vizgraph)$weight <- rowMeans(cbind(E(vizgraph)$proximity_1, E(vizgraph)$proximity_2), na.rm = TRUE)
+vizgraph <- delete_edge_attr(vizgraph, "proximity_1")
+vizgraph <- delete_edge_attr(vizgraph, "proximity_2")
+vizgraph <- delete_vertex_attr(vizgraph, "hs_product_name_short_en_2")
+vizgraph
+```
+
+The new network seems quite sparse and we should be able to get a
+meaningful representation rather than the hairball.
+
+```{r}
+edge_density(vizgraph)
+```
+
+## Generate layout of the nodes
+
+Before we jump to the visualization of full network, let's check how the
+mst skeleton looks.
+
+Here we use the Kamada-Kawai algorithm to generate a layout, which
+generally works well for smaller networks:
+
+```{r}
+position <- layout_with_kk(gmst)
+plot(gmst, layout = position, vertex.label = NA, vertex.size = 1)
+```
+
+The result already revealed some branches and clusters, we could use
+this layout as an initial position and speed up the generation of
+`vizgraph` layout.
+
+In this step, you would probably want to explore different layout
+algorithms, tune their parameters, and plot them until you get a
+satisfying position. Sometimes, it may require some manual adjustments
+before you finalize the layout.
+
+The following use the initial position of the mst, and optimize the
+layout of the whole network.
+
+```{r}
+position2 <- layout_with_kk(vizgraph, coords = position)
+plot(vizgraph, layout = position2, vertex.label = NA, vertex.size = 1)
+```
+
+The position output is a matrix, we could create a dataframe and merge
+it with the nodedf for future use.
+
+```{r}
+nodedf <- nodedf %>% mutate(x = position2[, 1], y = position2[, 2])
+head(nodedf)
+```
+
+## Community detection
+
+We would like to extract more meso-scale structural information out of
+this network representation, one option is to extract the community
+structure that reveal the block structure we saw in matrix plot.
+
+There are a number of community detection algorithms. The Louvain
+algorithm is one of the most widely used solution, and `igraph` has a
+function `cluster_louvain` that implements the method.
+
+```{r}
+comm <- cluster_louvain(vizgraph)
+length(comm)
+```
+
+We used the default parameter and get 41 communities.
+
+The `comm` is a `communities` object. We could also add the id by
+`membership` function to the nodedf dataframe for further analysis.
+
+```{r}
+nodedf <- nodedf %>% mutate(communityid = membership(comm))
+head(nodedf)
+```
+
+The size of each community is via `sizes` function:
+
+```{r}
+sizes(comm)
+```
+
+For each community, we could check the included products to understand
+its meaning.
+
+For example, community 8 is a cluster of garments and textile products
+
+```{r}
+nodedf %>%
+  filter(communityid == 8) %>%
+  sample_n(15)
+```
+
+Rearrange the rows and columns order, we see a clearer block structure
+in the matrxi view heatmap
+
+```{r}
+orderbycomm <- (nodedf %>% arrange(communityid))$hs_product_code
+ggplot(
+  proxdf %>%
+    mutate(
+      commoditycode_1 = factor(commoditycode_1, levels = orderbycomm),
+      commoditycode_2 = factor(commoditycode_2, levels = orderbycomm)
+    ),
+  aes(commoditycode_1, commoditycode_2, fill = proximity)
+) +
+  geom_raster() +
+  coord_equal() +
+  scale_fill_viridis() +
+  theme_void()
+```
+
+## Mapping properties to aesthetic elements
+
+Once we have fixed the position of nodes in the network, the aesthetic
+elements we could use are mainly the color and size of the nodes.
+Different shapes of the nodes are not very distinguishable with \>1000
+nodes, and labels are only usable to annotate few
+nodes/sectors/communities.
+
+In this section, we will use a saved output from the atlas of economic
+complexity for 2015. You could create these files by following previousl tutorials,
+or running the `economiccomplexity` package and collect outputs.
+
+```{r}
+if (!file.exists("df_ec.tsv")) {
+  download.file("https://www.dropbox.com/s/510nkpc7mwnjvbp/df_ec.tsv?dl=1", "df_ec.tsv")
+}
+df_ec <- read_tsv("df_ec.tsv")
+head(df_ec)
+```
+### use ggraph
+
+The aesthetic mapping could be done by manually creating vectors of color/shape/etc.
+as the input of `igrpah` plotting function. However, the more elegant and "tidy"
+flavor of graph ploting is to leverage the ability of `ggplot2` as a backend to do
+these mapping automatically. `ggraph` is a package that bridges the `ggplot2` system
+and graph object. There are other alternatives such as `ggnetwork` and `ggnet2`, but
+we will stick to the `ggraph` package hear for its rich features.
+
+The following codes converts the `vizgraph` object into the `tbl_graph` object
+
+```{r}
+vizgg <- vizgraph %>% as_tbl_graph()
+vizgg
+```
+ 
+You can see the object is actually two dataframes that could be altered with tidy verbs. The following
+shows how to left join our generated community id to this object:
+
+```{r}
+vizgg <- vizgg %>%
+  activate(nodes) %>%
+  left_join(nodedf %>% select(hs_product_code, communityid), by = c("name" = "hs_product_code"))
+vizgg
+```
+
+Let's use `ggplot2` style to plot this object with our generated layout `position2`,
+tune the theme:
+
+```{r}
+vizgg %>% ggraph(layout = position2) +
+  geom_edge_link(color = "grey") +
+  geom_node_point(color = "blue") +
+  theme_void()
+```
+
+
+
+### Color
+
+The color of the nodes are usually used to indicate different
+categories, such as 2-digit sectors or the communities we discovered
+above.
+
+A meaningful color map usually require some manual design, such as using
+brown to represent mining activities and products. Here we would just
+assign a color to each community without further improvement.
+
+```{r}
+vizgg %>% ggraph(layout = position2) +
+  geom_edge_link(color = "grey") +
+  geom_node_point(aes(color = factor(communityid))) +
+  theme_void() +
+  guides(color = guide_legend(title = "Community")) +
+  ggtitle("Visualization of communities in product space")
+```
+
+
+### Size
+
+We will use the node size to represent the PCI of each product, let's
+extract the PCI and join the graph object:
+
+```{r}
+vizgg <- vizgg %>%
+  activate(nodes) %>%
+  left_join(df_ec %>% select("hs_product_code", "pci") %>% distinct(), by = c("name" = "hs_product_code"))
+vizgg
+```
+Here we specify the size should be mapped to pci, and the `scale_*` function could
+be used to tune details. Let's save the object as `p` for further use
+
+```{r}
+p <- vizgg %>% ggraph(layout = position2) +
+  geom_edge_link(color = "grey") +
+  geom_node_point(aes(color = factor(communityid), size = pci)) +
+  scale_size(range = c(0.1, 3)) +
+  theme_void() +
+  guides(color = guide_legend(title = "Community"), size = guide_legend(title = "Product complexity"))
+p + ggtitle("Visualization of communities in product space")
+```
+
+### Annotation
+
+Sometimes we would like to add some annotations to the product space
+visualization. Here we will first calculate the center of each community:
+
+```{r}
+df_anno <- nodedf %>%
+  group_by(communityid) %>%
+  summarise(x = mean(x), y = mean(y))
+head(df_anno)
+```
+
+Add the communityid to the center with `geom_text`. You could also annotate nodes based on your needs.
+
+```{r}
+p + geom_text(data = df_anno, aes(x, y, label = communityid)) +
+  ggtitle("Visualization of communities in product space")
+```
+
+### Region specific plot
+
+With the full product space, we can highlight the products with RCA>1
+for a region. The following shows products of Japan in 2015.
+
+```{r}
+df_jpn <- df_ec %>%
+  filter(location_code == "JPN") %>%
+  select(hs_product_code, mcp)
+df_jpn
+```
+Join the dataset with graph object
+
+```{r}
+vizjpn <- vizgg %>%
+  activate(nodes) %>%
+  left_join(df_jpn, by = c("name" = "hs_product_code"))
+vizjpn
+```
+
+
+We could set the background layer as grey, and the node color that Japan doesn't
+have comparative advantage has alpha=0.
+
+```{r}
+vizjpn %>% ggraph(layout = position2) +
+  geom_edge_link(color = "grey") +
+  geom_node_point(aes(size = pci), color = "grey") +
+  geom_node_point(aes(color = factor(communityid), size = pci, alpha = factor(mcp))) +
+  scale_size(range = c(0.1, 3)) +
+  scale_alpha_manual(values = c(0, 1), na.value = 0, guide = "none") +
+  theme_void() +
+  guides(color = guide_legend(title = "Community"), size = guide_legend(title = "Product complexity")) +
+  ggtitle("Japan in the product space")
+```
+
+The visualization could be further improved with any `ggplot2` style tricks.
+
+## Save the result for future use
+
+After a series of operations, we finalized the visualization. It's
+better to save them and prevent repeating the same process.
+
+To save the plotting results, just use `ggsave`:
+
+```{r}
+ggsave("productspace.png", p)
+```
+
+Besides the visualization, you may also want to save the networks and
+node attributes dataframe, which helps you resume the analysis, or
+conduct analysis in other softwares. For example, save network into
+graphml format, and you could load it in Gephi for powerful plots.
+
+```{r}
+vizgraph %>% write_graph("productspace.graphml", format = "graphml")
+```
+
+## Why do we need the edges?
+
+As you may have noticed, in the network visualization above, we specify the edges to be grey
+and did nothing else. Most of the manipulations are for the layout of nodes, the color and size
+of nodes, the alpha of nodes, etc.
+
+If we ignore all the edges, and purely rely on the `nodedf`, we can still get reasonable plots as:
+
+```{r}
+nodedf <- nodedf %>%
+  left_join(df_ec %>% select("hs_product_code", "pci") %>% distinct())
+nodedf %>%
+  ggplot(aes(x, y, color = factor(communityid), size = pci)) +
+  geom_point() +
+  scale_size(range = c(0.1, 3)) +
+  theme_void() +
+  guides(color = guide_legend(title = "Community"), size = guide_legend(title = "Product complexity")) +
+  ggtitle("Visualization of product space without edge")
+```
+
+### UMAP visualization
+
+We will follow the above idea and use the umap to generate the "layout" and do the visualization.
+The UMAP is already used in the [Metroverse](https://metroverse.cid.harvard.edu/) for the visualization of industry space
+
+UMAP could calculate the distance metric from the raw data, or use the supplied distance matrix.
+Here we just use the same proximity matrix, and convert to a distance matrix:
+
+```{r}
+proxmat <- fullgraph %>% as_adj(attr = "proximity")
+distmat <- as.matrix(1 - proxmat)
+diag(distmat) <- 0
+dim(distmat)
+```
+
+Use 5 nearest neighbors, and specify our input is a distance matrix to generate the UMAP embedding:
+
+```{r}
+umapres <- umap(distmat, input = "dist", n_neighbors = 5)
+```
+
+Extract the embedding/layout into the nodedf matrix:
+
+```{r}
+nodedf <- nodedf %>%
+  mutate(umap_x = umapres$layout[, 1], umap_y = umapres$layout[, 2])
+head(nodedf)
+```
+
+Generate visualization with the UMAP layout:
+
+```{r}
+nodedf %>%
+  ggplot(aes(umap_x, umap_y, color = factor(communityid), size = pci)) +
+  geom_point() +
+  scale_size(range = c(0.1, 3)) +
+  theme_void() +
+  guides(color = guide_legend(title = "Community"), size = guide_legend(title = "Product complexity")) +
+  ggtitle("Visualization of product space with UMAP")
+```
+
+The communities extracted from network method still have interpretable meaning with the UMAP.
+However, you could use various clustering tools now to generate different group divisions.
+A good choice would be some density based clustering method such as dbscan/hdbsan.
+

@@ -1,0 +1,148 @@
+---
+title: "Other useful visualizations"
+output: 
+  html_notebook: 
+    fig_width: 8
+    fig_height: 6
+editor_options:
+  markdown:
+    wrap: 72
+---
+
+# 2. Other useful visualizations
+
+In this section, we will practice how to visualize with treemap and geographical maps,
+which are both commonly used in economic complexity analysis. Install and load necessary packages:
+
+```{r}
+package_list <-
+  c(
+    "tidyverse",
+    "viridis",
+    "sf",
+    "treemap",
+    "rnaturalearth",
+    "rnaturalearthdata"
+  )
+# Check if packages are already installed, otherwise install them
+to_install <-
+  package_list[!(package_list %in% installed.packages()[, "Package"])]
+if (length(to_install)) {
+  install.packages(to_install)
+}
+library(tidyverse)
+library(treemap)
+library(viridis)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+```
+
+Let's load the previously used output from the atlas of economic complexity for 2015.
+
+```{r}
+if (!file.exists("df_ec.tsv")) {
+  download.file("https://www.dropbox.com/s/510nkpc7mwnjvbp/df_ec.tsv?dl=1", "df_ec.tsv")
+}
+df_ec <- read_tsv("df_ec.tsv")
+head(df_ec)
+```
+
+## Treemap
+
+Again, let's use Japan as an example, aggregate to 2 digits level:
+```{r}
+df_jpn <- df_ec %>%
+  filter(location_code == "JPN", export_value > 0) %>%
+  select(hs_product_code, export_value) %>%
+  mutate(
+    category = if_else(str_length(hs_product_code) == 4, substring(hs_product_code, 1, 1), "service"),
+    hs_product_code = if_else(str_length(hs_product_code) == 4, substring(hs_product_code, 1, 2), hs_product_code)
+  ) %>%
+  group_by(hs_product_code, category) %>%
+  summarise(export_value = sum(export_value))
+head(df_jpn)
+```
+
+Load product names and merge:
+```{r}
+if (!file.exists("hs_product.zip")) {
+  download.file("http://intl-atlas-downloads.s3.amazonaws.com/17.0/hs_product.zip", "hs_product.zip")
+}
+hsdf <- read_csv("hs_product.zip", col_types = "c") %>% select(hs_product_code, hs_product_name_short_en)
+df_jpn <- df_jpn %>%
+  left_join(hsdf) %>%
+  left_join(hsdf %>% rename(category = hs_product_code, categoryname = hs_product_name_short_en)) %>%
+  mutate(categoryname = if_else(is.na(categoryname), category, categoryname))
+head(df_jpn)
+```
+
+
+Use the `treemap` package to plot a nested treemap
+
+```{r}
+treemap(df_jpn,
+  index = c("categoryname", "hs_product_name_short_en"),
+  vSize = "export_value",
+  type = "index",
+  title = "Export basket of Japan in 2015"
+)
+```
+
+## Geographical map
+
+The R geographcial packages have been moving to a `sf` package based ecosystem, where the spatial
+dataset becomes a dataframe-like structure, and the manipulation and visualization could be handled
+easily within the tidyverse framework. Load the worldmap and check the data:
+
+```{r}
+world <- ne_countries(scale = "medium", returnclass = "sf")
+head(world)
+```
+Plotting is simply with `ggplot2`:
+
+```{r}
+ggplot(data = world) +
+  geom_sf()
+```
+Manipulate the data as a dataframe:
+
+```{r}
+world <- world %>%
+  filter(pop_est > 0, continent != "Antarctica") %>%
+  mutate(gdp_per_cap = gdp_md_est / pop_est)
+```
+The data comes with GDP information, let's use it to color the countries and add additional elements
+
+```{r}
+ggplot(data = world) +
+  geom_sf(aes(fill = log(gdp_per_cap))) +
+  scale_fill_viridis() +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  ggtitle("World GDP per Capita") +
+  theme_bw()
+```
+Let's extract the ECI of each country
+
+```{r}
+df_eci <- df_ec %>%
+  select(location_code, location_name_short_en, eci) %>%
+  distinct() %>%
+  drop_na()
+head(df_eci)
+```
+
+Join the data, and plot:
+```{r}
+worldeci <- world %>%
+  left_join(df_eci, by = c("adm0_a3" = "location_code"))
+ggplot(data = worldeci) +
+  geom_sf(aes(fill = eci)) +
+  scale_fill_viridis() +
+  xlab("Longitude") +
+  ylab("Latitude") +
+  ggtitle("Country economic complexity index") +
+  theme_bw()
+```
+
